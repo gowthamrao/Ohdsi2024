@@ -1,15 +1,18 @@
 rstudioapi::getActiveDocumentContext()$path |> dirname() |> setwd()
 
 databasesOfInterest <-
-  c("IBM CCAE",
+  c(
+    "IBM CCAE",
     "IBM MDCD",
     "IBM MDCR",
     "Optum EHR",
     "OPTUM Extended SES",
-    "PharMetrics") |> unique() |> sort()
+    "PharMetrics",
+    "Meta-estimate"
+  ) |> unique() |> sort()
 
 ageGroupsOfInterest <-
-  c("30 - 39", "40 - 49", "50 - 59", "60 - 69", "70 - 79", "All") #"18 - 29",
+  c("30 - 39", "40 - 49", "50 - 59", "60 - 69", "70 - 79")
 
 removeConditions <-
   c(
@@ -17,13 +20,28 @@ removeConditions <-
     "Left Heart Failure" ,
     "Ankylosing Spondylitis",
     "Sarcoidosis",
-    "Coronary artery disease"
+    "Coronary artery disease",
+    "Persons at risk at start of year 2012-2022 with 365d prior observation"
   )
 
 rawData <-
   readr::read_csv(file = "result-data-full-incidenceRateTable-2024-06-17.csv", col_types = readr::cols()) |>
   dplyr::select(
-    -refId,-databaseId,-sourceName,-subgroupId,-outcomeId,-cleanWindow,-ageId,-genderId,-personsAtRiskPe,-personDaysPe,-personOutcomesPe,-outcomesPe,-outcomeCohortDefinitionId,-outcomeIdShort,-targetIdShort
+    -refId,
+    -databaseId,
+    -sourceName,
+    -subgroupId,
+    -outcomeId,
+    -cleanWindow,
+    -ageId,
+    -genderId,
+    -personsAtRiskPe,
+    -personDaysPe,
+    -personOutcomesPe,
+    -outcomesPe,
+    -outcomeCohortDefinitionId,
+    -outcomeIdShort,
+    -targetIdShort
   ) |>
   dplyr::mutate(
     targetName = stringr::str_replace_all(
@@ -91,6 +109,39 @@ rawData <-
     negate = TRUE
   ))
 
+
+
+rawData <- dplyr::bind_rows(
+  rawData,
+  rawData |>
+    dplyr::group_by(
+      cdmSourceAbbreviation,
+      targetCohortDefinitionId,
+      targetName,
+      outcomeName,
+      genderName,
+      startYear,
+      tar
+    ) |>
+    dplyr::summarise(
+      personsAtRisk = sum(personsAtRisk),
+      personDays = sum(personDays),
+      personOutcomes = sum(personOutcomes),
+      outcomes = sum(personOutcomes),
+      .groups = "drop"
+    ) |>
+    dplyr::ungroup() |>
+    dplyr::mutate(ageGroupName = "All") |>
+    dplyr::mutate(
+      incidenceRateP100py = (outcomes / (personDays / 365.25)) * 100,
+      incidenceProportionP100p = (personOutcomes / personsAtRisk) *
+        100
+    ) |>
+    dplyr::mutate(incidenceProportion = incidenceProportionP100p / 100)
+) |>
+  dplyr::mutate(personYears = personDays/365.25,
+                outcomes = abs(outcomes)) 
+
 rawData <- rawData |>
   dplyr::mutate(
     targetName = OhdsiHelpers::capitalizeFirstLetter(targetName),
@@ -124,10 +175,7 @@ rawData <- rawData |>
       TRUE ~ "Other"
     )
   ) |>
-  dplyr::relocate(conditionGroup) |>
-  dplyr::mutate(targetNameWithId = paste0(targetName, " (", (targetCohortDefinitionId -
-                                                               1) / 1000, ")")) |>
-  dplyr::mutate(incidenceProportion = incidenceProportionP100p / 100)
+  dplyr::relocate(conditionGroup)
 
 
 
@@ -135,12 +183,12 @@ library(meta)
 library(dplyr)
 
 # Define the function to extract meta-analysis results
-rand_te <- function(data) {
+rand_te <- function(data, .group) {
   random.meta <- meta::metarate(
     data = data,
-    event = outcomes,
-    time = personYears,
-    studlab = cdmSourceAbbreviation,
+    event = data$outcomes,
+    time = data$personYears,
+    studlab = data$cdmSourceAbbreviation,
     sm = "IRLN",
     comb.random = TRUE,
     method.tau = "DL"
@@ -158,7 +206,7 @@ rand_te <- function(data) {
   upper.predict <- random.meta[["upper.predict"]]
   seTE.predict <- random.meta[["seTE.predict"]]
   
-  # Return a data frame with the meta-analysis results
+  # Create a data frame with the meta-analysis results
   meta.out <-
     data.frame(
       random.te,
@@ -171,7 +219,7 @@ rand_te <- function(data) {
       lower.predict,
       upper.predict,
       seTE.predict
-    ) |> 
+    ) |>
     dplyr::mutate(
       ir.rand = exp(random.te) * 100,
       ir.rand.l = exp(random.te.lower) * 100,
@@ -180,33 +228,52 @@ rand_te <- function(data) {
       ir.predict.upper = exp(upper.predict) * 100
     ) |>
     dplyr::tibble()
+  
   return(meta.out)
 }
 
+# Apply the function to each group in plotData
+metaData <- rawData|> 
+  dplyr::select(startYear, conditionGroup, targetName, targetCohortDefinitionId, 
+                outcomeName, ageGroupName, genderName, personsAtRisk, outcomes, personYears, cdmSourceAbbreviation)
 
-meta <- plotData |> 
-  dplyr::group_by(startYear,
-                  conditionGroup,
-                  targetName) |> 
-  rand_te()
+metaData <- metaData |> 
+  dplyr::group_by(startYear, conditionGroup, targetName, targetCohortDefinitionId, outcomeName, ageGroupName, genderName) |>
+  dplyr::group_modify( ~ rand_te(.x, .y))
+
+metaDataSelected <- metaData |>
+  dplyr::ungroup() |>
+  dplyr::select(intersect(colnames(rawData), colnames(metaData)),
+                "ir.rand") |>
+  dplyr::rename(incidenceRateP100py = "ir.rand") |>
+  dplyr::mutate(
+    personsAtRisk = 0,
+    tar = rawData$tar |> unique(),
+    personDays = 0,
+    personOutcomes = 0,
+    incidenceProportion = 0,
+    incidenceProportionP100p = 0,
+    cdmSourceAbbreviation = "Meta-estimate",
+    outcomes = 0,
+    personYears = 0
+  )
+metaDataSelected <- metaDataSelected |>
+  dplyr::select(intersect(colnames(rawData), colnames(metaDataSelected)))
 
 
-
-
-
-
-
-
-
-
-
-
-
+rawData <- dplyr::bind_rows(
+  rawData,
+  metaDataSelected
+) |>
+  dplyr::mutate(targetNameWithId = paste0(targetName, " (", (targetCohortDefinitionId -
+                                                               1) / 1000, ")"))
 
 
 # table 1: persons studied
 rawData |>
-  dplyr::filter(ageGroupName != 'All') |>
+  dplyr::filter(ageGroupName == 'All',
+                startYear == 'All',
+                genderName == 'All') |>
   dplyr::group_by(conditionGroup,
                   targetName) |>
   dplyr::summarise(count = sum(personOutcomes), .groups = "keep") |>
@@ -561,35 +628,15 @@ conditionGroup1 <- OhdsiRPlots::arrangeGgplots(
 
 #######
 
-##############
+############## new plot 6/21/2024
 
 # plot of incidenceProportion * calendarYear -- all age, all gender
 plotData <- rawData |>
   dplyr::filter(
     startYear != 'All',
-    genderName != 'All',
-    cdmSourceAbbreviation %in% databasesOfInterest,
-    ageGroupName %in% ageGroupsOfInterest
-  ) |>
-  dplyr::group_by(
-    startYear,
-    conditionGroup,
-    targetName,
-    cdmSourceAbbreviation
-  ) |>
-  dplyr::summarise(
-    personDays = sum(personDays),
-    personOutcomes = sum(personOutcomes),
-    outcomes = sum(outcomes),
-    personsAtRisk = sum(personsAtRisk),
-    .groups = "keep"
-  ) |>
-  dplyr::ungroup() |>
-  dplyr::mutate(
-    personYears = personDays/365.25,
-    incidenceRateP100py = (outcomes / (personDays / 365.25)) * 100,
-    incidenceProportion = (personOutcomes / personsAtRisk) *
-      100
+    genderName == 'All',
+    ageGroupName  == 'All',
+    cdmSourceAbbreviation %in% databasesOfInterest
   ) |>
   dplyr::select(-personDays,
                 -personOutcomes,
@@ -637,10 +684,6 @@ createPlot <- function(df) {
   return(combinedPlot)
 }
 
-
-conditionGroups <- plotData$conditionGroup |> unique() |> sort()
-
-
 plots <- plotData |>
   createPlot()
 
@@ -675,4 +718,147 @@ irRnd <- meta::metarate(
 
 
 
+##########
+# plot of figure 2 - 6/21/2024
+plotData <- rawData |>
+  dplyr::filter(
+    startYear == 'All',
+    genderName != 'All',
+    ageGroupName != 'All',
+    cdmSourceAbbreviation %in% databasesOfInterest
+  ) |>
+  dplyr::mutate(isMale = if_else(genderName == 'MALE', 'M', 'F')) |>
+  dplyr::select(
+    -outcomes,
+    -personDays,
+    -personOutcomes,
+    -personsAtRisk,
+    -incidenceProportion,
+    -genderName
+  )
 
+createPlot <- function(df, titleText, yAxisLabel) {
+  # Error handling: Check if necessary columns exist
+  requiredCols <- c("startYear", "incidenceRateP100py", "isMale", "ageGroupName", "cdmSourceAbbreviation")
+  missingCols <- setdiff(requiredCols, names(df))
+  if (length(missingCols) > 0) {
+    stop(paste("Missing columns in data frame:", paste(missingCols, collapse = ", ")))
+  }
+  
+  # Define color palette for the data sources
+  cdmSourceAbbreviation <- unique(df$cdmSourceAbbreviation) |> sort()
+  colorPalette <- OhdsiRPlots::createOhdsiPalette(numColors = length(cdmSourceAbbreviation))
+  
+  # Adjust color palette to highlight 'Meta-estimate'
+  colorPalette[cdmSourceAbbreviation == "Meta-estimate"] <- "#FF0000"  # Red for visibility
+  
+  library(ggplot2)
+  ggplot(df, aes(
+    x = isMale,
+    y = incidenceRateP100py,
+    color = cdmSourceAbbreviation,        # Color by cdmSourceAbbreviation
+    group = cdmSourceAbbreviation         # Group by cdmSourceAbbreviation
+  )) +
+    geom_point(aes(size = (cdmSourceAbbreviation == "Meta-estimate")), shape = 18) +
+    scale_size_manual(values = c(`FALSE` = 2, `TRUE` = 4), guide = "none") +  # Larger size for 'Meta-estimate'
+    geom_line(aes(linetype = (cdmSourceAbbreviation == "Meta-estimate")),  # Conditional linetype for 'Meta-estimate'
+              size = 0.5, alpha = 0.5) +
+    scale_linetype_manual(values = c(`FALSE` = "dashed", `TRUE` = "solid"), guide = "none") +  # Solid line for 'Meta-estimate'
+    facet_grid(~ageGroupName, switch = "x") +
+    scale_color_manual(
+      values = colorPalette,
+      name = "Data source"
+    ) + 
+    labs(x = "Gender", y = yAxisLabel, title = titleText) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      strip.background = element_blank(),
+      strip.placement = "outside",
+      panel.spacing.x = unit(1, "lines"),
+      panel.background = element_rect(fill = "grey100", linetype = "dotted"),
+      axis.ticks.x = element_line(colour = "grey90"),
+      panel.grid.minor.x = element_blank()
+    ) +
+    scale_y_continuous(limits = c(0, NA))
+}
+
+
+
+selectedConditionGroup <- conditionGroups[[1]]
+targetNames <- plotData |>
+  dplyr::filter(conditionGroup == selectedConditionGroup) |> 
+  dplyr::pull(targetName) |> unique() |> sort()
+
+plots <- list()
+for (j in seq_along(targetNames)) {
+  plotDataFiltered <- plotData |>
+    dplyr::filter(conditionGroup == selectedConditionGroup) |> 
+    dplyr::filter(targetName == targetNames[[j]])
+  
+  plots[[j]] <- createPlot(df = plotDataFiltered, titleText = targetNames[[j]], yAxisLabel = "Incidence Rate Per 100 PY")
+}
+
+conditionGroup1 <- OhdsiRPlots::arrangeGgplots(
+  ggplotList = plots,
+  layoutInstruction = 'ncol = 2, nrow = 2',
+  shareX = TRUE,
+  shareY = TRUE
+)
+
+
+selectedConditionGroup <- conditionGroups[[2]]
+targetNames <- plotData |> 
+  dplyr::filter(conditionGroup == selectedConditionGroup) |> 
+  dplyr::pull(targetName) |> unique() |> sort()
+
+plots <- list()
+for (j in (1:length(targetNames))) {
+  plotDataFiltered <- plotData |>
+    dplyr::filter(conditionGroup == selectedConditionGroup) |> 
+    dplyr::filter(targetName == targetNames[[j]])
+  
+  # Assuming your data is in a dataframe called 'df'
+  plots[[j]] <- # Create the plot
+    createPlot(df = plotDataFiltered, titleText = targetNames[[j]], yAxisLabel = "Incidence Rate Per 100 PY")
+}
+
+conditionGroup2 <- OhdsiRPlots::arrangeGgplots(
+  ggplotList = plots,
+  layoutInstruction = 'ncol = 2, nrow = 3',
+  shareX = TRUE,
+  shareY = TRUE
+)
+
+
+
+selectedConditionGroup <- conditionGroups[[3]]
+targetNames <- plotData |> 
+  dplyr::filter(conditionGroup == selectedConditionGroup) |> 
+  dplyr::pull(targetName) |> unique() |> sort()
+
+plots <- list()
+for (j in (1:length(targetNames))) {
+  plotDataFiltered <- plotData |>
+    dplyr::filter(conditionGroup == selectedConditionGroup) |> 
+    dplyr::filter(targetName == targetNames[[j]])
+  
+  # Assuming your data is in a dataframe called 'df'
+  plots[[j]] <- # Create the plot
+    createPlot(df = plotDataFiltered, titleText = targetNames[[j]], yAxisLabel = "Incidence Rate Per 100 PY")
+}
+
+conditionGroup3 <- OhdsiRPlots::arrangeGgplots(
+  ggplotList = plots,
+  layoutInstruction = 'ncol = 2, nrow = 2',
+  shareX = TRUE,
+  shareY = TRUE
+)
+
+
+OhdsiRPlots::arrangeGgplots(
+  ggplotList = list(conditionGroup1, conditionGroup2, conditionGroup3),
+  layoutInstruction = 'ncol = 1, nrow = 3',
+  shareX = TRUE,
+  shareY = TRUE
+)
