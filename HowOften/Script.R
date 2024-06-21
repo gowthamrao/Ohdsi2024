@@ -1,3 +1,5 @@
+rstudioapi::getActiveDocumentContext()$path |> dirname() |> setwd()
+
 databasesOfInterest <-
   c("IBM CCAE",
     "IBM MDCD",
@@ -19,7 +21,7 @@ removeConditions <-
   )
 
 rawData <-
-  readr::read_csv(file = "D:\\studyResults\\HowOften\\result-data-full-incidenceRateTable-2024-06-17.csv", col_types = readr::cols()) |>
+  readr::read_csv(file = "result-data-full-incidenceRateTable-2024-06-17.csv", col_types = readr::cols()) |>
   dplyr::select(
     -refId,-databaseId,-sourceName,-subgroupId,-outcomeId,-cleanWindow,-ageId,-genderId,-personsAtRiskPe,-personDaysPe,-personOutcomesPe,-outcomesPe,-outcomeCohortDefinitionId,-outcomeIdShort,-targetIdShort
   ) |>
@@ -126,6 +128,81 @@ rawData <- rawData |>
   dplyr::mutate(targetNameWithId = paste0(targetName, " (", (targetCohortDefinitionId -
                                                                1) / 1000, ")")) |>
   dplyr::mutate(incidenceProportion = incidenceProportionP100p / 100)
+
+
+
+library(meta)
+library(dplyr)
+
+# Define the function to extract meta-analysis results
+rand_te <- function(data) {
+  random.meta <- meta::metarate(
+    data = data,
+    event = outcomes,
+    time = personYears,
+    studlab = cdmSourceAbbreviation,
+    sm = "IRLN",
+    comb.random = TRUE,
+    method.tau = "DL"
+  )
+  
+  # Extract relevant statistics from the meta-analysis result
+  random.te <- random.meta[["TE.random"]]
+  random.te.lower <- random.meta[["lower.random"]]
+  random.te.upper <- random.meta[["upper.random"]]
+  seTE.random <- random.meta[["seTE.random"]]
+  tau2 <- random.meta[["tau2"]]
+  se.tau2 <- random.meta[["se.tau2"]]
+  tau <- random.meta[["tau"]]
+  lower.predict <- random.meta[["lower.predict"]]
+  upper.predict <- random.meta[["upper.predict"]]
+  seTE.predict <- random.meta[["seTE.predict"]]
+  
+  # Return a data frame with the meta-analysis results
+  meta.out <-
+    data.frame(
+      random.te,
+      random.te.lower,
+      random.te.upper,
+      seTE.random,
+      tau2,
+      se.tau2,
+      tau,
+      lower.predict,
+      upper.predict,
+      seTE.predict
+    ) |> 
+    dplyr::mutate(
+      ir.rand = exp(random.te) * 100,
+      ir.rand.l = exp(random.te.lower) * 100,
+      ir.rand.u = exp(random.te.upper) * 100,
+      ir.predict.lower = exp(lower.predict) * 100,
+      ir.predict.upper = exp(upper.predict) * 100
+    ) |>
+    dplyr::tibble()
+  return(meta.out)
+}
+
+
+meta <- plotData |> 
+  dplyr::group_by(startYear,
+                  conditionGroup,
+                  targetName) |> 
+  rand_te()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 # table 1: persons studied
 rawData |>
@@ -482,6 +559,92 @@ conditionGroup1 <- OhdsiRPlots::arrangeGgplots(
   shareY = TRUE
 )
 
+#######
+
+##############
+
+# plot of incidenceProportion * calendarYear -- all age, all gender
+plotData <- rawData |>
+  dplyr::filter(
+    startYear != 'All',
+    genderName != 'All',
+    cdmSourceAbbreviation %in% databasesOfInterest,
+    ageGroupName %in% ageGroupsOfInterest
+  ) |>
+  dplyr::group_by(
+    startYear,
+    conditionGroup,
+    targetName,
+    cdmSourceAbbreviation
+  ) |>
+  dplyr::summarise(
+    personDays = sum(personDays),
+    personOutcomes = sum(personOutcomes),
+    outcomes = sum(outcomes),
+    personsAtRisk = sum(personsAtRisk),
+    .groups = "keep"
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(
+    personYears = personDays/365.25,
+    incidenceRateP100py = (outcomes / (personDays / 365.25)) * 100,
+    incidenceProportion = (personOutcomes / personsAtRisk) *
+      100
+  ) |>
+  dplyr::select(-personDays,
+                -personOutcomes,
+                -personsAtRisk,
+                -incidenceProportion)
+
+
+createPlot <- function(df) {
+  
+  df <- df |> 
+    dplyr::mutate(startYear = as.numeric(startYear))
+  library(ggplot2)
+  library(OhdsiRPlots)
+  library(patchwork)# For arranging plots
+  
+  # 1. Unique Target Names and Color Palette
+  cdmSourceAbbreviation <- unique(df$cdmSourceAbbreviation)
+  palette <- OhdsiRPlots::createOhdsiPalette(numColors = length(cdmSourceAbbreviation))
+  
+  # 2. Color Mapping
+  color_map <- setNames(palette, cdmSourceAbbreviation)
+  
+  # 4. Create Individual Plots
+  plots <- lapply(unique(df$targetName), function(source) {
+    filtered_df <- df[df$targetName == source, ]
+    
+    plot <- ggplot(filtered_df, aes(x = startYear, y = incidenceRateP100py, group = cdmSourceAbbreviation, color = cdmSourceAbbreviation)) +
+      geom_line(alpha = 0.5) +
+      geom_smooth(se = FALSE) +
+      labs(x = "Start Year", y = "IR Per 100 PY",
+           title = source) +
+      scale_color_manual(values = color_map) +
+      theme_minimal() +
+      expand_limits(y = 0) +
+      scale_x_continuous(breaks = seq(min(filtered_df$startYear), max(filtered_df$startYear), by = 5)) +
+      theme(legend.position = "none") # Remove legend from individual plots
+    
+    return(plot)
+  })
+  
+  # Combine plots and add a shared legend
+  combinedPlot <- wrap_plots(plots) + plot_layout(guides = 'collect')
+  combinedPlot <- combinedPlot & theme(legend.position = "right") # Position the collected legend at the bottom
+  
+  return(combinedPlot)
+}
+
+
+conditionGroups <- plotData$conditionGroup |> unique() |> sort()
+
+
+plots <- plotData |>
+  createPlot()
+
+
 
 
 plotDataFiltered <- plotData |> 
@@ -509,65 +672,6 @@ irRnd <- meta::metarate(
 )
 
 
-library(meta)
-library(dplyr)
-
-# Filter the data
-plotDataFiltered <- plotData |> 
-  dplyr::filter(targetName == 'Acute Myocardial Infarction',
-                startYear == '2012') |> 
-  dplyr::select(startYear, conditionGroup, targetName, cdmSourceAbbreviation, outcomes, personYears, incidenceRateP100py)
-
-# Define the function to extract meta-analysis results
-rand_te <- function(data) {
-  random.meta <- meta::metarate(
-    data = data,
-    event = outcomes,
-    time = personYears,
-    studlab = cdmSourceAbbreviation,
-    sm = "IRLN",
-    comb.random = TRUE,
-    method.tau = "DL"
-  )
-  
-  # Extract relevant statistics from the meta-analysis result
-  random.te <- random.meta[["TE.random"]]
-  random.te.lower <- random.meta[["lower.random"]]
-  random.te.upper <- random.meta[["upper.random"]]
-  seTE.random <- random.meta[["seTE.random"]]
-  tau2 <- random.meta[["tau2"]]
-  se.tau2 <- random.meta[["se.tau2"]]
-  tau <- random.meta[["tau"]]
-  lower.predict <- random.meta[["lower.predict"]]
-  upper.predict <- random.meta[["upper.predict"]]
-  seTE.predict <- random.meta[["seTE.predict"]]
-  
-  # Return a data frame with the meta-analysis results
-  meta.out <-
-    data.frame(
-      random.te,
-      random.te.lower,
-      random.te.upper,
-      seTE.random,
-      tau2,
-      se.tau2,
-      tau,
-      lower.predict,
-      upper.predict,
-      seTE.predict
-    ) %>%
-    dplyr::mutate(
-      ir.rand = exp(random.te) * 100,
-      ir.rand.l = exp(random.te.lower) * 100,
-      ir.rand.u = exp(random.te.upper) * 100,
-      ir.predict.lower = exp(lower.predict) * 100,
-      ir.predict.upper = exp(upper.predict) * 100
-    ) |>
-    dplyr::tibble()
-  return(meta.out)
-}
-
-meta <- rand_te(data = plotData)
 
 
 
